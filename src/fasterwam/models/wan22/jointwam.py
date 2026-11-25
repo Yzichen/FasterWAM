@@ -58,17 +58,21 @@ class JointWAM(FastWAM):
     ) -> list[torch.Tensor]:
         total_seq_len = video_seq_len + action_seq_len
         base_mask = torch.zeros((total_seq_len, total_seq_len), dtype=torch.bool, device=device)
+        
+        # video -> video
         base_mask[:video_seq_len, :video_seq_len] = self._build_video_attention_mask(
             video_seq_len=video_seq_len,
             video_tokens_per_frame=video_tokens_per_frame,
             device=device,
         )
+        # action -> action
         base_mask[video_seq_len:, video_seq_len:] = True
 
         attention_masks = []
         for layer_idx in range(int(self.mot.num_layers)):
             layer_mask = base_mask.clone()
             if layer_idx in self._mot_action_video_attention_layer_set:
+                # action -> full video
                 layer_mask[video_seq_len:, :video_seq_len] = True
             attention_masks.append(layer_mask)
         return attention_masks
@@ -322,16 +326,16 @@ class JointWAM(FastWAM):
             generator=video_generator,
             device=rand_device,
             dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        ).to(device=self.device, dtype=self.torch_dtype)  # (1, 48, T_v=3, H/16, W/16)
         latents_action = torch.randn(
             (1, action_horizon, self.action_expert.action_dim),
             generator=action_generator,
             device=rand_device,
             dtype=torch.float32,
-        ).to(device=self.device, dtype=self.torch_dtype)
+        ).to(device=self.device, dtype=self.torch_dtype)  # (1, T_a=32, act_dim=7)
 
         input_image = input_image.to(device=self.device, dtype=self.torch_dtype)
-        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)
+        first_frame_latents = self._encode_input_image_latents_tensor(input_image=input_image, tiled=tiled)  # (1, 48, 1, H/16, W/16)
         latents_video[:, :, 0:1] = first_frame_latents.clone()
         fuse_flag = bool(getattr(self.video_expert, "fuse_vae_embedding_in_latents", False))
 
@@ -343,7 +347,7 @@ class JointWAM(FastWAM):
             raise ValueError("Either `prompt` or both `context/context_mask` must be provided.")
 
         if use_prompt:
-            context, context_mask = self.encode_prompt(prompt)
+            context, context_mask = self.encode_prompt(prompt)  # (1, L_context=128, C_text=4096), (1, L_context=128)
         else:
             if context is None or context_mask is None:
                 raise ValueError("`context` and `context_mask` must be both provided together.")
@@ -362,7 +366,7 @@ class JointWAM(FastWAM):
                 context=context,
                 context_mask=context_mask,
                 proprio=proprio,
-            )
+            )  # (1, L_context=128, C_text=4096), (1, L_context=128)
 
         infer_timesteps_video, _ = self.infer_video_scheduler.build_inference_schedule(
             num_inference_steps=num_inference_steps,
@@ -385,21 +389,21 @@ class JointWAM(FastWAM):
             action_seq_len=latents_action.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
-        )
+        )  # List[(L_v+T_a, L_v+T_a), ...]
         video_attention_mask = self._build_video_attention_mask(
             video_seq_len=video_seq_len,
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_pre["tokens"].device,
-        )
+        )  # (L_v, L_v)
         video_kv_cache = self.mot.prefill_video_cache(
-            video_tokens=video_pre["tokens"],
-            video_freqs=video_pre["freqs"],
-            video_t_mod=video_pre["t_mod"],
-            video_context_payload={
-                "context": video_pre["context"],
-                "mask": video_pre["context_mask"],
+            video_tokens=video_pre["tokens"],  # (B, L_v=T_v*N_patch_per_frame, C_wan=3072)
+            video_freqs=video_pre["freqs"],    # (L_v, 1, 64), torch.complex128.
+            video_t_mod=video_pre["t_mod"],    # (B, L_v, 6, C_wan=3072)
+            video_context_payload={  
+                "context": video_pre["context"],    # (B, L_context, C_wan=3072)
+                "mask": video_pre["context_mask"],  # (B, L_context)
             },
-            video_attention_mask=video_attention_mask,
+            video_attention_mask=video_attention_mask,  # (L_v, L_v)
         )
 
         infer_timesteps_action, infer_deltas_action = self.infer_action_scheduler.build_inference_schedule(

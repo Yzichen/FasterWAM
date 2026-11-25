@@ -525,26 +525,41 @@ class FastWAM(torch.nn.Module):
         return (video_loss_token * valid).sum(dim=1) / valid_sum
 
     def training_loss(self, sample, tiled: bool = False):
+        """
+        Args:
+            sample: dict{
+                'video': (B, 3, T_video=9, H=224, W=448),
+                'action': (B, T_a=32, action_dim=7),
+                'proprio': (B, T_p=32, proprio_dim=8),
+                'prompt': str,
+                'context': (B, L_text=128, C_text=4096),
+                'context_mask': (B, L_text=128, ),
+                'image_is_pad': (B, T_video=9, ),
+                'action_is_pad': (B, T_a=32, ),
+                'proprio_is_pad': (B, T_obs=33, )
+            }
+        """
+        
         inputs = self.build_inputs(sample, tiled=tiled)
-        input_latents = inputs["input_latents"]
+        input_latents = inputs["input_latents"]  # (B, z_dim=48, T_v=T_video//4+1=3, H/16, W/16)
         batch_size = input_latents.shape[0]
-        context = inputs["context"]
-        context_mask = inputs["context_mask"]
-        action = inputs["action"]
-        action_is_pad = inputs["action_is_pad"]
-        image_is_pad = inputs["image_is_pad"]
+        context = inputs["context"]  # (B, L_context=L_text+1, C_text=4096)
+        context_mask = inputs["context_mask"]  # (B, L_context=L_text+1)
+        action = inputs["action"]    # (B, T_a=32, action_dim=7)
+        action_is_pad = inputs["action_is_pad"]  # (B, T_a=32)
+        image_is_pad = inputs["image_is_pad"]    # (B, T_video=9)
 
-        noise_video = torch.randn_like(input_latents)
+        noise_video = torch.randn_like(input_latents)  # (B, z_dim=48, T_v=T_video//4+1=3, H/16, W/16)
         timestep_video = self.train_video_scheduler.sample_training_t(
             batch_size=batch_size,
             device=self.device,
             dtype=input_latents.dtype,
-        )
-        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)
-        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)
+        )  # (B, )
+        latents = self.train_video_scheduler.add_noise(input_latents, noise_video, timestep_video)  # (B, z_dim=48, T_v=T_video//4+1=3, H/16, W/16)
+        target_video = self.train_video_scheduler.training_target(input_latents, noise_video, timestep_video)  # (B, z_dim=48, T_v=T_video//4+1=3, H/16, W/16)
 
         if inputs["first_frame_latents"] is not None:
-            latents[:, :, 0:1] = inputs["first_frame_latents"]
+            latents[:, :, 0:1] = inputs["first_frame_latents"]  # 第一帧不加噪
 
         noise_action = torch.randn_like(action)
         timestep_action = self.train_action_scheduler.sample_training_t(
@@ -552,63 +567,68 @@ class FastWAM(torch.nn.Module):
             device=self.device,
             dtype=action.dtype,
         )
-        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)
-        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)
+        noisy_action = self.train_action_scheduler.add_noise(action, noise_action, timestep_action)  # (B, T_a=32, action_dim=7)
+        target_action = self.train_action_scheduler.training_target(action, noise_action, timestep_action)  # (B, T_a=32, action_dim=7)
 
         video_pre = self.video_expert.pre_dit(
-            x=latents,
-            timestep=timestep_video,
-            context=context,
-            context_mask=context_mask,
-            action=action,
+            x=latents,        # (B, z_dim=48, T_v=T_video//4+1=3, H/16, W/16)
+            timestep=timestep_video,    # (B, )
+            context=context,  # (B, L=L_text+1, C_text=4096)
+            context_mask=context_mask,  # (B, L=L_text+1)
+            action=action,    # (B, T_a=32, action_dim=7)
             fuse_vae_embedding_in_latents=inputs["fuse_vae_embedding_in_latents"],
         )
 
         action_pre = self.action_expert.pre_dit(
-            action_tokens=noisy_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
+            action_tokens=noisy_action,  # (B, T_a=32, action_dim=7)
+            timestep=timestep_action,    # (B, )
+            context=context,             # (B, L=L_text+1, C_text=4096)
+            context_mask=context_mask,   # (B, L=L_text+1)
         )
 
-        video_tokens = video_pre["tokens"]
-        action_tokens = action_pre["tokens"]
+        video_tokens = video_pre["tokens"]  # (B, L_v=T_v*N_patch_per_frame, C_wan=3072)
+        action_tokens = action_pre["tokens"]  # (B, T_a=32, C_act=1024)
 
         attention_masks = self._build_mot_attention_masks(
             video_seq_len=video_tokens.shape[1],
             action_seq_len=action_tokens.shape[1],
             video_tokens_per_frame=int(video_pre["meta"]["tokens_per_frame"]),
             device=video_tokens.device,
-        )
+        )  # List[(L_v+T_a, L_v+T_a), ...]
+
+        # tokens_out: dict{
+        #   'video': (B, L_v, C_wan=3072),
+        #   'action': (B, T_a, C_act=1024)
+        # }
         tokens_out = self.mot(
             embeds_all={
-                "video": video_tokens,
-                "action": action_tokens,
+                "video": video_tokens,    # (B, L_v=T_v*N_patch_per_frame, C_wan=3072)
+                "action": action_tokens,  # (B, T_a=32, C_act=1024)
             },
-            attention_mask=attention_masks,
+            attention_mask=attention_masks,  # List[(L_v+T_a, L_v+T_a), ...]
             freqs_all={
-                "video": video_pre["freqs"],
-                "action": action_pre["freqs"],
+                "video": video_pre["freqs"],    # (L_v, 1, 64), torch.complex128.
+                "action": action_pre["freqs"],  # (T_a, 1, 64), torch.complex128.
             },
             context_all={
                 "video": {
-                    "context": video_pre["context"],
-                    "mask": video_pre["context_mask"],
-                },
+                    "context": video_pre["context"],    # (B, L_context, C_wan=3072)
+                    "mask": video_pre["context_mask"],  # (B, L_v, L_context)
+                }, 
                 "action": {
-                    "context": action_pre["context"],
-                    "mask": action_pre["context_mask"],
+                    "context": action_pre["context"],   # (B, L_context, C_act=1024)
+                    "mask": action_pre["context_mask"], # (B, T_a, L_context) 
                 },
             },
             t_mod_all={
-                "video": video_pre["t_mod"],
-                "action": action_pre["t_mod"],
+                "video": video_pre["t_mod"],    # (B, L_v, 6, C_wan=3072)
+                "action": action_pre["t_mod"],  # (B, 6, C_act=1024)
             },
         )
 
-        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)
+        pred_video = self.video_expert.post_dit(tokens_out["video"], video_pre)   # (B, Z_dim=48, T_v=3, H/16, W/16)
 
-        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)
+        pred_action = self.action_expert.post_dit(tokens_out["action"], action_pre)  # (B, T_a=32, action_dim=7)
 
         include_initial_video_step = inputs["first_frame_latents"] is None
         if inputs["first_frame_latents"] is not None:
@@ -782,21 +802,21 @@ class FastWAM(torch.nn.Module):
         video_seq_len: int,
     ) -> torch.Tensor:
         action_pre = self.action_expert.pre_dit(
-            action_tokens=latents_action,
-            timestep=timestep_action,
-            context=context,
-            context_mask=context_mask,
+            action_tokens=latents_action,  # (B, T_a=32, action_dim=7)
+            timestep=timestep_action,  # (B, )
+            context=context,  # (B, L_context=128, C_text=4096)
+            context_mask=context_mask,  # (B, L_context=128)
         )
         action_tokens = self.mot.forward_action_with_video_cache(
-            action_tokens=action_pre["tokens"],
-            action_freqs=action_pre["freqs"],
-            action_t_mod=action_pre["t_mod"],
+            action_tokens=action_pre["tokens"],  # (B, T_a=32, C_act=1024)
+            action_freqs=action_pre["freqs"],  # (T_a, 1, 64), torch.complex128.
+            action_t_mod=action_pre["t_mod"],  # (B, 6, C_act=1024) 
             action_context_payload={
-                "context": action_pre["context"],
-                "mask": action_pre["context_mask"],
+                "context": action_pre["context"],    # (B, L_context, C_act=1024)
+                "mask": action_pre["context_mask"],  # (B, L_context)
             },
-            video_kv_cache=video_kv_cache,
-            attention_mask=attention_mask,
+            video_kv_cache=video_kv_cache,  # List[dict{"k": (B, L_v, G*C'), "v": (B, L_v, G*C')}, ...], len = num_layers
+            attention_mask=attention_mask,  # List[(L_v+T_a, L_v+T_a), ...]
             video_seq_len=video_seq_len,
         )
         return self.action_expert.post_dit(action_tokens, action_pre)

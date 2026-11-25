@@ -192,20 +192,20 @@ class SparseMoT(MoT):
                 f"got {len(interval_kv)}."
             )
 
-        logits = self.video_kv_fusion_logits[interval_idx]
-        weights = torch.softmax(logits, dim=0)
+        logits = self.video_kv_fusion_logits[interval_idx]  # (N_interval, )
+        weights = torch.softmax(logits, dim=0)  # (N_interval, )
         fused_k = None
         fused_v = None
         for weight, layer_kv in zip(weights, interval_kv):
             if "k" not in layer_kv or "v" not in layer_kv:
                 raise ValueError("Each interval K/V entry must contain `k` and `v`.")
-            k = layer_kv["k"]
-            v = layer_kv["v"]
+            k = layer_kv["k"]  # (B, L_v, C_wan=3072)
+            v = layer_kv["v"]  # (B, L_v, C_wan=3072)
             layer_weight = weight.to(device=k.device, dtype=k.dtype)
             weighted_k = k * layer_weight
             weighted_v = v * layer_weight.to(device=v.device, dtype=v.dtype)
-            fused_k = weighted_k if fused_k is None else fused_k + weighted_k
-            fused_v = weighted_v if fused_v is None else fused_v + weighted_v
+            fused_k = weighted_k if fused_k is None else fused_k + weighted_k   # (B, L_v, C_wan=3072)
+            fused_v = weighted_v if fused_v is None else fused_v + weighted_v   # (B, L_v, C_wan=3072)
         if fused_k is None or fused_v is None:
             raise ValueError(f"Condition layer {condition_layer} has an empty K/V interval.")
         return {"k": fused_k, "v": fused_v}
@@ -315,7 +315,7 @@ class SparseMoT(MoT):
         interval_kv: list[dict[str, torch.Tensor]] = []
 
         for layer_idx in range(self.num_layers):
-            layer_attention_mask = attention_masks[layer_idx]
+            layer_attention_mask = attention_masks[layer_idx]  # (L_v+T_a, L_v+T_a)
             video_io = self._build_video_attention_io(
                 tokens_all=tokens_all,
                 freqs_all=freqs_all,
@@ -331,34 +331,34 @@ class SparseMoT(MoT):
                 layer_idx=layer_idx,
             )
 
-            interval_kv.append({"k": video_io["k"], "v": video_io["v"]})
-            video_mask = layer_attention_mask[:video_seq_len, :video_seq_len]
+            interval_kv.append({"k": video_io["k"], "v": video_io["v"]})  # List[dict{k: (B, L_v, C_wan=3072), v: (B, L_v, C_wan=3072)}, ...]
+            video_mask = layer_attention_mask[:video_seq_len, :video_seq_len]  # (L_v, L_v)
             mixed_video = self._mixed_attention_with_num_heads(
-                q_cat=video_io["q"],
-                k_cat=video_io["k"],
-                v_cat=video_io["v"],
+                q_cat=video_io["q"],  # (B, L_v, C_wan=3072)
+                k_cat=video_io["k"],  # (B, L_v, C_wan=3072)
+                v_cat=video_io["v"],  # (B, L_v, C_wan=3072)
                 attention_mask=video_mask,
                 num_heads=self.num_heads,
             )
 
             if layer_idx in self.condition_layer_set:
-                action_attention_mask = layer_attention_mask[video_seq_len:total_seq_len, :total_seq_len]
-                fused_video_kv = self._fuse_video_kv(layer_idx, interval_kv)
+                action_attention_mask = layer_attention_mask[video_seq_len:total_seq_len, :total_seq_len]  # (T_a, L_v+T_a)
+                fused_video_kv = self._fuse_video_kv(layer_idx, interval_kv)  # {k: (B, L_v, C_wan=3072), v: (B, L_v, C_wan=3072)}
                 mixed_action = self._mixed_attention_with_num_heads(
-                    q_cat=action_io["q"],
-                    k_cat=torch.cat([fused_video_kv["k"], action_io["k"]], dim=1),
-                    v_cat=torch.cat([fused_video_kv["v"], action_io["v"]], dim=1),
+                    q_cat=action_io["q"],  # (B, T_a, C_wan=3072)
+                    k_cat=torch.cat([fused_video_kv["k"], action_io["k"]], dim=1),  # (B, T_a, C_wan=3072)
+                    v_cat=torch.cat([fused_video_kv["v"], action_io["v"]], dim=1),  # (B, T_a, C_wan=3072)
                     attention_mask=action_attention_mask,
-                    num_heads=self.num_heads,
+                    num_heads=self.num_heads,  # 24
                 )
                 interval_kv = []
             else:
                 mixed_action = self._mixed_attention_with_num_heads(
-                    q_cat=action_io["q"],
-                    k_cat=action_io["k"],
-                    v_cat=action_io["v"],
+                    q_cat=action_io["q"],  # (B, T_a, C_act=1024)
+                    k_cat=action_io["k"],  # (B, T_a, C_act=1024)
+                    v_cat=action_io["v"],  # (B, T_a, C_act=1024)
                     attention_mask=None,
-                    num_heads=int(action_io["block"].num_heads),
+                    num_heads=int(action_io["block"].num_heads),  # 8
                 )
 
             tokens_all["video"] = self._apply_post_with_optional_checkpoint(
@@ -394,6 +394,37 @@ class SparseMoT(MoT):
         context_all: Dict[str, Optional[dict]],
         t_mod_all: Dict[str, torch.Tensor],
     ):
+        """
+        Args:
+            embeds_all: dict{
+                'video': (B, L_v, C_wan=3072),
+                'action': (B, T_a=32, C_act=1024),
+            }   
+            attention_mask: List[(L_v+T_a, L_v+T_a), ...]
+            freqs_all: dict{
+                'video': (L_v, 1, 64), torch.complex128.
+                'action': (T_a, 1, 64), torch.complex128.
+            }
+            context_all: dict{
+                'video': dict{
+                    'context': (B, L_context, C_wan=3072),
+                    'mask': (B, L_v, L_context),
+                },
+                'action': dict{
+                    'context': (B, L_context, C_act=1024),
+                    'mask': (B, T_a, L_context),
+                },
+            }
+            t_mod_all: dict{
+                'video': (B, L_v, 6, C_wan=3072),
+                'action': (B, 6, C_act=1024)
+            }
+        Returns:
+            t_mod_all: dict{
+                'video': (B, L_v, C_wan=3072),
+                'action': (B, T_a, C_act=1024)
+            }
+        """
         for name in ("video", "action"):
             if name not in embeds_all:
                 raise ValueError(f"Missing expert tokens for {name!r}")
